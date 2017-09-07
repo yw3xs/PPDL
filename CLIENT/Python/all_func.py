@@ -1,8 +1,16 @@
-# Python Users Functions for MIDDLE
+# Functions for different users
 # Author: Yang Wang
-# TODO: refactor the code and modulize it!
+# 1. read whole MNIST dataset and also the sub-dataset belonging to a specific user
+# 2. download model and parameters from center
+# 3. sample batch from the dataset
+# 4. calculate gradient and add noise
+# 5. keep accountant of privacy budget
+# 6. implement report-noisy-max or exponential mechanism
 
-# import all the packages
+###########################
+# import and constants
+
+# import packages
 from __future__ import division
 import sys
 import time
@@ -21,7 +29,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
 # import dp_optimizer
 # import sanitizer
 
-# for testing purpose
+# import for testing purpose
 import CLIENT.Python.config as config
 import CLIENT.Python.noise as noise
 import CLIENT.Python.dataPrep as dataPrep
@@ -31,192 +39,144 @@ import CLIENT.Python.dp_optimizer as dp_optimizer
 import CLIENT.Python.sanitizer as sanitizer
 import CLIENT.Python.download_and_convert_mnist as download_and_convert_mnist
 
-# define constants for the model and the user
+# constants
 NUM_TRAINING_IMAGES = 60000
 NUM_TESTING_IMAGES = 10000
 IMAGE_SIZE = 28
-batch_size = 500
-epochs = 3
-mnist_train_file = '/home/yang/Research/Privacy-preserving-DL/MIDDLE_DNN/MIDDLE/DATA/MNIST/mnist_train.tfrecord'
-mnist_test_file = '/home/yang/Research/Privacy-preserving-DL/MIDDLE_DNN/MIDDLE/DATA/MNIST/mnist_test.tfrecord'
-epsilon = .1 # privacy budget for each epoch
+mnist_train_file = '/home/yang/Research/Privacy-preserving-DL/PPDL/DATA/MNIST/mnist_train.tfrecord'
+mnist_test_file = '/home/yang/Research/Privacy-preserving-DL/PPDL/DATA/MNIST/mnist_test.tfrecord'
 
+# parameters
+batch_size = 500
+epochs = 3   ## ?? ##
+epsilon = .1 # privacy budget for each epoch
+delta = .000001
 learning_rate = .1
 grad_bound = .001
-grad_threshold = .0001
-grad_upload_ratio = .001 # upload gradients for 0.1% of the parameters each time. In this case,
-grad_upload_num = int((784*64 + 640) * grad_upload_ratio)  # around
+grad_threshold = .0001  # for SVT
+grad_upload_ratio = .001 # ratio of parameters for uploading at each iteration
+grad_upload_num = int((784*64 + 640) * grad_upload_ratio) # number of parameters for uploading at each iteration
 
-# read/download in the data file from MNIST site for this user
-start_index = 1
-sample_size = 10000
-
-# put the data for this user here!
-user_dataset_dir = '/home/yang/Research/Privacy-preserving-DL/MIDDLE_DNN/MIDDLE/CLIENT/Python/userData/user1'
-#download_and_convert_mnist.run(user_dataset_dir, sample_size, start_index)
-
-#########################
-# link to firebase database
-print config.config
-print 'Linking to Firebase database'
-firebase = pyrebase.initialize_app(config.config)
-db = firebase.database()
-
-# Read the model constants from the firebase database (assume the model will not change for this version, will consider model change in future versions)
-print ' '
-print 'Downloading model from server'
-model = dict(db.child('model').get().val())
-print model
-
-# Build the user child database
-uid = 'py2'
-userIter = -1 # userIter is the parameter iteration on which the computation of gradient is based. e.g., if userIter = 10, that meanes the gradient is calculated using the parameter in the 10th iteration.
-# initialize gradient (hardcoded for now, TODO: make it more flexible in the future)
-initGrad1 = np.zeros(model['param_num'][0])  # first layer
-initGrad2 = np.zeros(model['param_num'][1])  # final layer
-initParam1 = np.zeros(model['param_num'][0])
-initParam2 = np.zeros(model['param_num'][1])
-
-userData = {
-    'users/' + uid :{
-        'userID': uid,
-        'userIter': userIter,
-        'grad1': list(initGrad1),
-        'grad2': list(initGrad2)
-        #'param_layer1': list(initParam1),
-        #'param_layer2': list(initParam2),
-    }
-}
-db.update(userData)
-
-# # define the network parameters
-# network_parameters = utils.NetworkParameters()
-# network_parameters.input_size = model['D']
-# network_parameters.default_gradient_l2norm_bound = model['gradient_clip_bound']  # norm clipping
-# num_hidden_layers = model['num_hidden_layers']
-# hidden_layer_num_units = model['hidden_layer_num_units']  # number of neurons at each hidden layer
-# #for i in xrange(num_hidden_layers):
-# hidden = utils.LayerParameters()
-# hidden.name = "hidden%d" % 0
-# hidden.num_units = hidden_layer_num_units
-# hidden.relu = model['hidden_layer_relu']
-# hidden.with_bias = model['hidden_layer_bias']
-# network_parameters.layer_parameters.append(hidden)
-#
-# # output layer
-# logits = utils.LayerParameters()
-# logits.name = "logits"
-# logits.num_units = model['logits_num_units']
-# logits.relu = model['logits_relu']
-# logits.with_bias = model['logits_with_bias']
-# network_parameters.layer_parameters.append(logits)
-
-# define functions to read the data
-def MnistInputAll(mnist_data_file):
-  """Create operations to read the MNIST input file.
-
-  Args:
-    mnist_data_file: Path of a tfrecord file containing the MNIST images to process.
-
-  Returns:
-    images: A list with the formatted image data. shape [10000, 28*28]
-    labels: A list with the labels for each image.  shape [10000]
-  """
-  with tf.Session() as sess:
-      file_queue = tf.train.string_input_producer([mnist_data_file], num_epochs= 1)
-      reader = tf.TFRecordReader()
-      _, value = reader.read(file_queue)
-      example = tf.parse_single_example(
-          value,
-          features={"image/encoded": tf.FixedLenFeature(shape=(), dtype=tf.string),
-                    "image/class/label": tf.FixedLenFeature([1], tf.int64)})
-
-      image = tf.cast(tf.image.decode_png(example["image/encoded"], channels=1),
-                      tf.float32)
-      image = tf.reshape(image, [IMAGE_SIZE * IMAGE_SIZE])
-      image /= 255
-      label = tf.cast(example["image/class/label"], dtype=tf.int32)
-      label = tf.reshape(label, [])
-
-      init_op = tf.global_variables_initializer()
-      init_op2 = tf.local_variables_initializer()
-      sess.run(init_op)
-      sess.run(init_op2)
-      coord = tf.train.Coordinator()
-      threads = tf.train.start_queue_runners(coord=coord)
-      images = []
-      labels = []
-      try:
-          while True:
-              i, l = sess.run([image, label])
-              i = i.tolist()
-              images.append(i)
-              labels.append(l)
-      except tf.errors.OutOfRangeError, e:
-          coord.request_stop(e)
-      finally:
-          coord.request_stop()
-          coord.join(threads)
-
-      return images, labels
-
-# def MnistInput(mnist_data_file, batch_size, randomize):
-#   """Create operations to read the MNIST input file.
-#
-#   Args:
-#     mnist_data_file: Path of a file containing the MNIST images to process.
-#     batch_size: size of the mini batches to generate.
-#     randomize: If true, randomize the dataset.
-#
-#   Returns:
-#     images: A tensor with the formatted image data. shape [batch_size, 28*28]
-#     labels: A tensor with the labels for each image.  shape [batch_size]
-#   """
-#   file_queue = tf.train.string_input_producer([mnist_data_file], num_epochs= 1)
-#   reader = tf.TFRecordReader()
-#   _, value = reader.read(file_queue)
-#   example = tf.parse_single_example(
-#       value,
-#       features={"image/encoded": tf.FixedLenFeature(shape=(), dtype=tf.string),
-#                 "image/class/label": tf.FixedLenFeature([1], tf.int64)})
-#
-#   image = tf.cast(tf.image.decode_png(example["image/encoded"], channels=1),
-#                   tf.float32)
-#   image = tf.reshape(image, [IMAGE_SIZE * IMAGE_SIZE])
-#   image /= 255
-#   label = tf.cast(example["image/class/label"], dtype=tf.int32)
-#   label = tf.reshape(label, [])
-#
-#   if randomize:
-#     images, labels = tf.train.shuffle_batch(
-#         [image, label], batch_size=batch_size,
-#         capacity=(batch_size * 100),
-#         min_after_dequeue=(batch_size * 10))
-#   else:
-#     images, labels = tf.train.batch([image, label], batch_size=batch_size)
-#
-#   return images, labels
-
-# read parameters from firebase
+# neural network structures
+units = [128,64]  # number of units in each hidden layer
+layers = 2  # number of hidden layer
 
 
-# where to save the intermediate results!
-save_path = '/home/yang/Research/Privacy-preserving-DL/MIDDLE_DNN/MIDDLE'
 
-# read the data
-user1 = '/home/yang/Research/Privacy-preserving-DL/MIDDLE_DNN/MIDDLE/CLIENT/Python/userData/user1/mnist_train.tfrecord'
 
-images, labels = MnistInputAll(user1)  # images and labels are lists
-testimages, testlabels = MnistInputAll(mnist_test_file)
-# dimension of images: 10000*784
-# dimension of labels: 10000
+
+
+# function to read the MNIST dataset (when whole = "True") or the user dataset (when whole = "False")
+def MnistInput(mnist_data_file, whole=True, start=None, size=None):
+    """Create operations to read the MNIST input file.
+      Args:
+        mnist_data_file: Path of a tfrecord file containing the MNIST images to process.
+        whole: when set to true, return the whole MNIST dataset (training or test set)
+        start: start index of the first sample in the user dataset
+        size: size of the user dataset
+
+      Returns:
+        images: A list with the formatted image data. default shape [10000, 28*28]
+        labels: A list with the labels for each image. default shape [10000]
+      """
+    with tf.Session() as sess:
+        file_queue = tf.train.string_input_producer([mnist_data_file], num_epochs=1)
+        reader = tf.TFRecordReader()
+        _, value = reader.read(file_queue)
+        example = tf.parse_single_example(
+            value,
+            features={"image/encoded": tf.FixedLenFeature(shape=(), dtype=tf.string),
+                      "image/class/label": tf.FixedLenFeature([1], tf.int64)})
+
+        image = tf.cast(tf.image.decode_png(example["image/encoded"], channels=1),
+                        tf.float32)
+        image = tf.reshape(image, [IMAGE_SIZE * IMAGE_SIZE])
+        image /= 255
+        label = tf.cast(example["image/class/label"], dtype=tf.int32)
+        label = tf.reshape(label, [])
+
+        init_op = tf.global_variables_initializer()
+        init_op2 = tf.local_variables_initializer()
+        sess.run(init_op)
+        sess.run(init_op2)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(coord=coord)
+        images = []
+        labels = []
+        if whole:
+            try:
+                while True:
+                    i, l = sess.run([image, label])
+                    i = i.tolist()
+                    images.append(i)
+                    labels.append(l)
+            except tf.errors.OutOfRangeError, e:
+                coord.request_stop(e)
+            finally:
+                coord.request_stop()
+                coord.join(threads)
+        else:
+            try:
+                for k in xrange(start - 1):
+                    sess.run([image, label])
+                for k in xrange(start, start + size):
+                    i, l = sess.run([image, label])
+                    i = i.tolist()
+                    images.append(i)
+                    labels.append(l)
+            except tf.errors.OutOfRangeError, e:
+                coord.request_stop(e)
+            finally:
+                coord.request_stop()
+                coord.join(threads)
+
+        return images, labels
+
+
+# build the neural network given the model parameters and calculate the gradient
+def buildNN(units,layers,parameters,iter):
+    """Create operations to read the MNIST input file.
+        Args:
+            units: number of units in each hidden layer
+            layers: number of hidden layers
+            parameters: weights and bias for each layer (list of list)
+            iter: iteration number
+
+        Returns:
+            images: A list with the formatted image data. default shape [10000, 28*28]
+            labels: A list with the labels for each image. default shape [10000]
+    """
+    tf.Graph().as_default()
+    tf.device('/cpu:0')
+    with tf.Session() as sess:
+        lr = tf.placeholder(tf.float32)  # learning rate
+        eps = tf.placeholder(tf.float32)  # epsilon (privacy parameter)
+        delta = tf.placeholder(tf.float32)  # delta (privacy parameter)
+        # hard-coded the network structure
+        W1 = tf.Variable(parameters[0], dtype=tf.float32)  # second layer
+        W2 = tf.Variable(parameters[1], dtype=tf.float32)  # third layer
+        init = tf.global_variables_initializer()
+        init_2 = tf.local_variables_initializer()
+        sess.run(init)
+        sess.run(init_2)
+
+
+
+
+
+
+
+
+
+#images, labels = MnistInputAll(user1)  # images and labels are lists
+#testimages, testlabels = MnistInputAll(mnist_test_file)
+
 images = tf.convert_to_tensor(images, dtype=tf.float32)
 labels = tf.convert_to_tensor(labels)
 
 testimages = tf.convert_to_tensor(testimages, dtype=tf.float32)
 testlabels = tf.convert_to_tensor(testlabels)
 
-################## above all understood! ########################
 ##################### Start training the model ################################
 # 1. set up the network
 # 2. start the iteration
@@ -228,10 +188,6 @@ testlabels = tf.convert_to_tensor(testlabels)
 tf.Graph().as_default()
 tf.device('/cpu:0')
 sess = tf.Session()
-
-
-# with tf.Graph().as_default(), tf.Session() as sess, tf.device('/cpu:0'):
-
 
 while True:
     lr = tf.placeholder(tf.float32)  # learning rate
@@ -247,8 +203,6 @@ while True:
     print "iter: " + str(serverIter)
     serverParam1 = np.reshape(serverParam1, (784,64))
     serverParam2 = np.reshape(serverParam2, (64,10))
-
-
 
     W1 = tf.Variable(serverParam1, dtype=tf.float32)  # second layer
     W2 = tf.Variable(serverParam2, dtype=tf.float32)  # third layer
